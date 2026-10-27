@@ -564,6 +564,8 @@ pub fn create_descriptor_chain(
 
 #[cfg(test)]
 mod tests {
+    use std::array;
+
     use super::*;
 
     #[test]
@@ -648,9 +650,33 @@ mod tests {
         )
         .unwrap();
         let mut reader = Reader::new_read_only(&memory, chain).unwrap();
+        let expected: [u8; 256] = array::from_fn(|index| index as u8);
+        memory.write_slice(&expected, GuestAddress(0x2000)).unwrap();
         assert_eq!(reader.available_bytes(), 256);
         let mut data = [0; 256];
         reader.read_exact(&mut data).unwrap();
+        assert_eq!(data, expected);
+        assert_eq!(reader.available_bytes(), 0);
+    }
+
+    #[test]
+    fn read_only_reader_follows_descriptor_links() {
+        use crate::virtio::queue::tests::VirtQueue;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &memory, 8);
+        queue.dtable[3].set(0x4000, 2, VIRTQ_DESC_F_NEXT, 1);
+        queue.dtable[1].set(0x5000, 3, VIRTQ_DESC_F_NEXT, 6);
+        queue.dtable[6].set(0x6000, 3, 0, 0);
+        memory.write_slice(b"ab", GuestAddress(0x4000)).unwrap();
+        memory.write_slice(b"cde", GuestAddress(0x5000)).unwrap();
+        memory.write_slice(b"fgh", GuestAddress(0x6000)).unwrap();
+
+        let chain = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 3).unwrap();
+        let mut reader = Reader::new_read_only(&memory, chain).unwrap();
+        let mut data = [0; 8];
+        reader.read_exact(&mut data).unwrap();
+        assert_eq!(&data, b"abcdefgh");
         assert_eq!(reader.available_bytes(), 0);
     }
 

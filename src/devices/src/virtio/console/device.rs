@@ -36,7 +36,7 @@ fn read_control_command(
     let mut reader = match Reader::new_read_only(mem, head) {
         Ok(reader) => reader,
         Err(e) => {
-            log::error!("Invalid console control descriptor memory: {e}");
+            log::error!("Invalid console control descriptor chain: {e}");
             return None;
         }
     };
@@ -430,6 +430,7 @@ mod tests {
     fn process_control_chain(
         command: VirtioConsoleControl,
         descriptors: &[(u64, u32, u16, u16)],
+        head_index: u16,
     ) -> ProcessResult {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let queues = [0, 0x400, 0x800, 0xc00]
@@ -452,7 +453,7 @@ mod tests {
                 }
             }
         }
-        queues[CONTROL_TXQ_INDEX].avail.ring[0].set(0);
+        queues[CONTROL_TXQ_INDEX].avail.ring[0].set(head_index);
         queues[CONTROL_TXQ_INDEX].avail.idx.set(1);
 
         let device_queues = queues
@@ -507,6 +508,7 @@ mod tests {
                 let result = process_control_chain(
                     command,
                     &[(CONTROL_ADDR, size_of::<VirtioConsoleControl>() as u32, 0, 0)],
+                    0,
                 );
 
                 assert!(result.raised_irq);
@@ -527,9 +529,15 @@ mod tests {
             value: 1,
         };
         let chains = [
-            ("contiguous", vec![(CONTROL_ADDR, 8, 0, 0)]),
+            (
+                "nonzero head",
+                1,
+                vec![(0, 0, VIRTQ_DESC_F_WRITE, 0), (CONTROL_ADDR, 8, 0, 0)],
+            ),
+            ("contiguous", 0, vec![(CONTROL_ADDR, 8, 0, 0)]),
             (
                 "split",
+                0,
                 vec![
                     (CONTROL_ADDR, 3, VIRTQ_DESC_F_NEXT, 1),
                     (CONTROL_ADDR + 0x100, 5, 0, 0),
@@ -537,12 +545,12 @@ mod tests {
             ),
         ];
 
-        for (name, chain) in chains {
-            let result = process_control_chain(command, &chain);
+        for (name, head_index, chain) in chains {
+            let result = process_control_chain(command, &chain, head_index);
 
             assert!(result.raised_irq, "{name}");
             assert_eq!(result.used_index, 1, "{name}");
-            assert_eq!(result.used_id, 0, "{name}");
+            assert_eq!(result.used_id, u32::from(head_index), "{name}");
             assert_eq!(result.used_len, 0, "{name}");
             let Some(Payload::ConsoleControl(response)) = result.console.control.queue_pop() else {
                 panic!("expected port-add response");
@@ -608,7 +616,7 @@ mod tests {
         ];
 
         for (name, chain) in chains {
-            let result = process_control_chain(command, &chain);
+            let result = process_control_chain(command, &chain, 0);
 
             assert!(result.raised_irq, "{name}");
             assert_eq!(result.used_index, 1, "{name}");
@@ -626,8 +634,11 @@ mod tests {
             event: control_event::VIRTIO_CONSOLE_PORT_READY,
             value: 1,
         };
-        let result =
-            process_control_chain(command, &[(CONTROL_ADDR, 8, VIRTQ_DESC_F_NEXT, QUEUE_SIZE)]);
+        let result = process_control_chain(
+            command,
+            &[(CONTROL_ADDR, 8, VIRTQ_DESC_F_NEXT, QUEUE_SIZE)],
+            0,
+        );
 
         assert!(!result.raised_irq);
         assert_eq!(result.used_index, 0);
