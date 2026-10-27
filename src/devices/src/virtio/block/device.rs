@@ -9,6 +9,7 @@ use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
@@ -19,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    DynStorage, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageOpenOptions,
-    SyncFormatAccess, file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
+    DynStorage, FormatAccess, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
+    StorageOpenOptions, file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
 };
 use log::{error, warn};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -46,7 +47,7 @@ use super::{
 
 use crate::virtio::{
     ActivateError, InterruptTransport,
-    block::{ImageType, SyncMode},
+    block::{DiskFormat, SyncMode},
 };
 
 /// Configuration options for disk caching.
@@ -77,14 +78,14 @@ impl CacheType {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(crate) file: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
     image_id: Vec<u8>,
 }
 
 impl DiskProperties {
     pub fn new(
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
     ) -> io::Result<Self> {
@@ -242,7 +243,7 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -270,7 +271,7 @@ impl Block {
         partuuid: Option<String>,
         cache_type: CacheType,
         disk_image_path: String,
-        disk_image_format: ImageType,
+        disk_image_format: DiskFormat,
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
@@ -289,32 +290,30 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
+        let file = ImagoFile::open(file_opts)?;
         let discard_alignment = file.discard_align();
 
         let disk_image = match disk_image_format {
-            ImageType::Qcow2 => {
+            DiskFormat::Qcow2 => {
                 let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
                         Box::new(file),
                         !is_disk_read_only,
                     )?;
-                qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
+                qcow2.open_implicit_dependencies()?;
+                FormatAccess::new(qcow2)
             }
-            ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
+            DiskFormat::Raw => {
+                let raw =
+                    Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
+                FormatAccess::new(raw)
             }
-            ImageType::Vmdk => {
+            DiskFormat::Vmdk => {
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )
-                .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
+                .open(PermissiveImplicitOpenGate::default())?;
+                FormatAccess::new(vmdk)
             }
         };
 
@@ -394,6 +393,10 @@ impl VirtioDevice for Block {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioBlkConfig>() as u32)
     }
 
     fn avail_features(&self) -> u64 {

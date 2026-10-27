@@ -2,6 +2,7 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -52,7 +53,7 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
-    virtual_entries: Vec<VirtualDirEntry>,
+    virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
@@ -67,7 +68,7 @@ impl Fs {
         shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
-        virtual_entries: Vec<VirtualDirEntry>,
+        virtual_entries: Vec<VirtualDirEntry<'static>>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -134,6 +135,14 @@ impl Fs {
         cfg.export_fsid
     }
 
+    pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry<'static>) {
+        self.virtual_entries.push(entry);
+    }
+
+    pub fn set_exit_code(&mut self, exit_code: Arc<AtomicI32>) {
+        self.exit_code = exit_code;
+    }
+
     #[cfg(target_os = "macos")]
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
         self.map_sender = Some(map_sender);
@@ -163,6 +172,10 @@ impl VirtioDevice for Fs {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioFsConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {

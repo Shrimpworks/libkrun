@@ -6,6 +6,8 @@ fn musl_target_for_host() -> &'static str {
     let host = env::var("TARGET").unwrap_or_default();
     if host.starts_with("aarch64") {
         "aarch64-unknown-linux-musl"
+    } else if host.starts_with("riscv64") {
+        "riscv64gc-unknown-linux-musl"
     } else {
         "x86_64-unknown-linux-musl"
     }
@@ -121,6 +123,24 @@ fn build_rust_init() -> PathBuf {
         // flags from the Makefile would be silently ignored. Remove it so
         // the per-target env vars take effect.
         cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            let target_env_key = musl_target.to_uppercase().replace('-', "_");
+            let linker_triple = musl_target.replace("-unknown", "").replace("-musl", "-gnu");
+            let linker = if cfg!(target_os = "windows") {
+                "clang"
+            } else {
+                "/usr/bin/clang"
+            };
+            cmd.env(format!("CARGO_TARGET_{target_env_key}_LINKER"), linker);
+            cmd.env(
+                format!("CARGO_TARGET_{target_env_key}_RUSTFLAGS"),
+                format!(
+                    "-C link-arg=-target -C link-arg={linker_triple} \
+                     -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug"
+                ),
+            );
+        }
     }
 
     let mut features: Vec<&str> = Vec::new();

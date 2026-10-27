@@ -5,6 +5,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+mod acpi;
+pub use self::acpi::{PciFunctionInfo, PciHostInfo};
 mod gdt;
 /// Contains logic for setting up Advanced Programmable Interrupt Controller (local version).
 pub mod interrupts;
@@ -30,7 +32,6 @@ use crate::x86_64::layout::{EBDA_START, FIRST_ADDR_PAST_32BITS, MMIO_MEM_START};
 #[cfg(feature = "tee")]
 use crate::x86_64::layout::{FIRMWARE_SIZE, FIRMWARE_START};
 use crate::{ArchMemoryInfo, InitrdConfig};
-#[cfg(all(not(feature = "tee"), target_os = "linux"))]
 use arch_gen::x86::bootparam::E820_RESERVED;
 use arch_gen::x86::bootparam::{E820_RAM, boot_params};
 use vm_memory::Bytes;
@@ -60,6 +61,8 @@ unsafe impl ByteValued for BootParamsWrapper {}
 pub enum Error {
     /// Invalid e820 setup params.
     E820Configuration,
+    /// Invalid ACPI table setup params.
+    AcpiSetup(acpi::Error),
     /// Error writing MP table to memory.
     #[cfg(any(not(feature = "tee"), feature = "tdx"))]
     MpTableSetup(mptable::Error),
@@ -195,8 +198,10 @@ pub fn arch_memory_regions(
         ram_above_gap,
         ram_last_addr,
         shm_start_addr,
+        // To be filled later using GuestMemory.
+        guest_last_addr: 0,
         page_size,
-        initrd_addr: ram_last_addr - initrd_size,
+        initrd_addr: ram_last_addr.min(MMIO_MEM_START) - initrd_size,
         firmware_addr,
     };
     (info, regions)
@@ -266,6 +271,8 @@ pub fn arch_memory_regions(
         ram_above_gap,
         ram_last_addr,
         shm_start_addr,
+        // To be filled later with GuestMemory.
+        guest_last_addr: 0,
         page_size,
         initrd_addr: layout::INITRD_SEV_START,
         firmware_addr: 0,
@@ -291,7 +298,8 @@ pub fn setup_mptable_for_tdshim(guest_mem: &GuestMemoryMmap, num_cpus: u8) -> su
 /// * `initrd` - Information about where the ramdisk image was loaded in the `guest_mem`.
 /// * `num_cpus` - Number of virtual CPUs the guest will have.
 /// * `pvh` - Whether to use the PVH boot protocol.
-#[allow(unused_variables)]
+/// * `pci_host` - The PCI host configuration if enabled.
+#[allow(unused_variables, clippy::too_many_arguments)]
 pub fn configure_system(
     guest_mem: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,
@@ -300,14 +308,28 @@ pub fn configure_system(
     initrd: &Option<InitrdConfig>,
     num_cpus: u8,
     pvh: bool,
+    acpi_enabled: bool,
+    virtio_mmio_devices: &[(u64, u32)],
+    pci_host: Option<&PciHostInfo>,
 ) -> super::Result<()> {
-    // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
-    #[cfg(not(feature = "tee"))]
-    mptable::setup_mptable(guest_mem, num_cpus).map_err(Error::MpTableSetup)?;
+    if acpi_enabled {
+        acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices, pci_host)
+            .map_err(Error::AcpiSetup)?;
+    } else {
+        // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
+        #[cfg(not(feature = "tee"))]
+        mptable::setup_mptable(guest_mem, num_cpus).map_err(Error::MpTableSetup)?;
+    }
 
     if pvh {
         #[cfg(all(not(feature = "tee"), target_os = "linux"))]
-        configure_pvh(guest_mem, arch_memory_info, cmdline_addr, initrd)?;
+        configure_pvh(
+            guest_mem,
+            arch_memory_info,
+            cmdline_addr,
+            initrd,
+            acpi_enabled,
+        )?;
     } else {
         configure_64bit_boot(
             guest_mem,
@@ -316,6 +338,7 @@ pub fn configure_system(
             cmdline_size,
             initrd,
             num_cpus,
+            acpi_enabled,
         )?;
     }
     Ok(())
@@ -327,6 +350,7 @@ fn configure_pvh(
     arch_memory_info: &ArchMemoryInfo,
     cmdline_addr: GuestAddress,
     initrd: &Option<InitrdConfig>,
+    acpi_enabled: bool,
 ) -> Result<(), Error> {
     const XEN_HVM_START_MAGIC_VALUE: u32 = 0x336e_c578;
     let first_addr_past_32bits = GuestAddress(FIRST_ADDR_PAST_32BITS);
@@ -341,13 +365,23 @@ fn configure_pvh(
         });
     }
     let mut memmap: Vec<hvm_memmap_table_entry> = Vec::new();
-    add_memmap_entry(&mut memmap, 0, mptable::MPTABLE_START, E820_RAM);
-    add_memmap_entry(
-        &mut memmap,
-        mptable::MPTABLE_START,
-        layout::RSDP_ADDR - mptable::MPTABLE_START,
-        E820_RESERVED,
-    );
+    if acpi_enabled {
+        add_memmap_entry(&mut memmap, 0, EBDA_START, E820_RAM);
+        add_memmap_entry(
+            &mut memmap,
+            EBDA_START,
+            layout::HIMEM_START - EBDA_START,
+            E820_RESERVED,
+        );
+    } else {
+        add_memmap_entry(&mut memmap, 0, mptable::MPTABLE_START, E820_RAM);
+        add_memmap_entry(
+            &mut memmap,
+            mptable::MPTABLE_START,
+            layout::RSDP_ADDR - mptable::MPTABLE_START,
+            E820_RESERVED,
+        );
+    }
     let last_addr = GuestAddress(arch_memory_info.ram_last_addr);
     if last_addr < end_32bit_gap_start {
         add_memmap_entry(
@@ -376,6 +410,7 @@ fn configure_pvh(
         magic: XEN_HVM_START_MAGIC_VALUE,
         version: 1,
         cmdline_paddr: cmdline_addr.raw_value(),
+        rsdp_paddr: if acpi_enabled { layout::RSDP_ADDR } else { 0 },
         memmap_paddr: layout::MEMMAP_START,
         memmap_entries: memmap.len() as u32,
         nr_modules: modules.len() as u32,
@@ -409,6 +444,7 @@ fn configure_64bit_boot(
     cmdline_size: usize,
     initrd: &Option<InitrdConfig>,
     #[allow(unused_variables)] num_cpus: u8,
+    acpi_enabled: bool,
 ) -> super::Result<()> {
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
     const KERNEL_HDR_MAGIC: u32 = 0x5372_6448;
@@ -445,6 +481,14 @@ fn configure_64bit_boot(
             params.0.hdr.syssize = num_cpus as u32;
         }
         add_e820_entry(&mut params.0, 0, EBDA_START, E820_RAM)?;
+        if acpi_enabled {
+            add_e820_entry(
+                &mut params.0,
+                EBDA_START,
+                layout::HIMEM_START - EBDA_START,
+                E820_RESERVED,
+            )?;
+        }
     }
 
     let last_addr = GuestAddress(arch_memory_info.ram_last_addr);
@@ -483,6 +527,17 @@ fn configure_64bit_boot(
     guest_mem
         .write_obj(params, zero_page_addr)
         .map_err(|_| Error::ZeroPageSetup)?;
+
+    if acpi_enabled {
+        // acpi_rsdp_addr lives at byte offset 0x70 (112) in the real kernel
+        // ABI's boot_params struct. The vendored bindgen bindings here predate
+        // that named field — it falls inside `_pad3`, which starts at exactly
+        // that offset. Writing the raw u64 there is ABI-equivalent to setting
+        // the named field on current kernels.
+        guest_mem
+            .write_obj(layout::RSDP_ADDR, zero_page_addr.unchecked_add(0x70))
+            .map_err(|_| Error::ZeroPageSetup)?;
+    }
 
     Ok(())
 }
@@ -548,12 +603,52 @@ mod tests {
         assert_eq!(GuestAddress(1u64 << 32), regions[2].0);
     }
 
+    #[cfg(not(feature = "tee"))]
+    fn assert_initrd_in_low_ram(memory_size: usize, initrd_size: u64) {
+        let (info, regions) = arch_memory_regions(
+            memory_size,
+            Some(KERNEL_LOAD_ADDR),
+            KERNEL_SIZE,
+            initrd_size,
+            None,
+        );
+        let initrd_end = info.initrd_addr + initrd_size;
+
+        assert_eq!(info.initrd_addr, MMIO_MEM_START - initrd_size);
+        assert!(regions.iter().any(|(start, size)| {
+            let start = start.raw_value();
+            let end = start + *size as u64;
+
+            info.initrd_addr >= start && initrd_end <= end
+        }));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn initrd_stays_in_low_ram_when_memory_crosses_mmio_gap() {
+        const INITRD_SIZE: u64 = 32 << 20;
+
+        assert_initrd_in_low_ram(3330usize << 20, INITRD_SIZE);
+        assert_initrd_in_low_ram(4096usize << 20, INITRD_SIZE);
+    }
+
     #[test]
     fn test_system_configuration() {
         let no_vcpus = 4;
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let info = ArchMemoryInfo::default();
-        let config_err = configure_system(&gm, &info, GuestAddress(0), 0, &None, 1, false);
+        let config_err = configure_system(
+            &gm,
+            &info,
+            GuestAddress(0),
+            0,
+            &None,
+            1,
+            false,
+            false,
+            &[],
+            None,
+        );
         assert!(config_err.is_err());
         #[cfg(not(feature = "tee"))]
         assert_eq!(
@@ -574,6 +669,9 @@ mod tests {
             &None,
             no_vcpus,
             false,
+            false,
+            &[],
+            None,
         )
         .unwrap();
 
@@ -590,6 +688,9 @@ mod tests {
             &None,
             no_vcpus,
             false,
+            false,
+            &[],
+            None,
         )
         .unwrap();
 
@@ -606,6 +707,9 @@ mod tests {
             &None,
             no_vcpus,
             false,
+            false,
+            &[],
+            None,
         )
         .unwrap();
     }
